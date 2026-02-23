@@ -3,12 +3,10 @@ use itertools::Itertools;
 use ndarray::{Array, Array2, ArrayBase, CowArray, CowRepr, Dim, IxDynImpl};
 use ort::{
     environment::Environment,
-    execution_providers::ExecutionProvider,
     session::{builder::GraphOptimizationLevel, Session},
-    value::Value,
     SessionBuilder,
 };
-use tokenizers::{Encoding, Tokenizer};
+use std::error::Error;use tokenizers::{Encoding, Tokenizer};
 
 use crate::clip_image_processor::CLIPImageProcessor;
 
@@ -157,18 +155,19 @@ impl EmbedImage {
 fn create_session(model_path: &str) -> Result<Session, Box<dyn Error + Send + Sync>> {
     let environment = Environment::builder()
         .with_name("embed-rs")
-        .with_execution_providers([ExecutionProvider::CPU(Default::default())])
         .build()?
         .into_arc();
+    
     let num_cpus = num_cpus::get();
-    let session = SessionBuilder::new(&environment)?
+    let session = SessionBuilder::new()
+        .with_environment(environment)?
         .with_parallel_execution(true)?
         .with_intra_threads(num_cpus as i16)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
-        .with_model_from_file(model_path)?;
+        .commit_from_file(model_path)?;
+    
     Ok(session)
 }
-
 fn try_extract(
     outputs: Vec<Value<'_>>,
     embed_index: usize,

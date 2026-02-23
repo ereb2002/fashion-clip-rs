@@ -1,158 +1,182 @@
-use std::error::Error;
-use itertools::Itertools;
-use ndarray::{Array, Array2, ArrayBase, CowArray, CowRepr, Dim, IxDynImpl};
+// src/embed.rs
+use anyhow::{anyhow, Result};
+use image::{DynamicImage, ImageBuffer, Rgb};
+use ndarray::{Array, Axis, IxDyn, s};
 use ort::{
     environment::Environment,
     session::{builder::GraphOptimizationLevel, Session},
+    value::Value,
     SessionBuilder,
 };
-use std::error::Error;use tokenizers::{Encoding, Tokenizer};
-
-use crate::clip_image_processor::CLIPImageProcessor;
+use std::path::Path;
+use std::sync::Arc;
+use tokenizers::Tokenizer;
 
 pub struct EmbedText {
     session: Session,
     tokenizer: Tokenizer,
+    max_length: usize,
 }
 
 impl EmbedText {
-    pub fn new(
-        text_model_path: &str,
-        text_model_for_tokenizer: &str,
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let session = create_session(text_model_path)?;
-        let tokenizer = Self::create_tokenizer(text_model_for_tokenizer)?;
-        Ok(EmbedText { session, tokenizer })
+    pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self> {
+        // Crear entorno
+        let environment = Environment::builder()
+            .with_name("fashion-clip-text")
+            .build()?
+            .into_arc();
+
+        // Crear sesión con la nueva API
+        let session = SessionBuilder::new()
+            .with_environment(environment)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)?
+            .commit_from_file(model_path)?;
+
+        // Cargar tokenizer
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| anyhow!("Error loading tokenizer: {}", e))?;
+
+        Ok(Self {
+            session,
+            tokenizer,
+            max_length: 77, // Longitud típica para CLIP
+        })
     }
 
-    pub fn encode(
-        &self,
-        text: &String,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        if text.is_empty() {
-            return Err("No text provided".into());
+    pub fn encode(&self, text: &str) -> Result<Vec<f32>> {
+        // Tokenizar
+        let encoding = self.tokenizer.encode(text, true)
+            .map_err(|e| anyhow!("Tokenization error: {}", e))?;
+
+        let mut input_ids = encoding.get_ids().to_vec();
+        let mut attention_mask = encoding.get_attention_mask().to_vec();
+
+        // Truncar/padding a max_length
+        if input_ids.len() > self.max_length {
+            input_ids.truncate(self.max_length);
+            attention_mask.truncate(self.max_length);
+        } else {
+            input_ids.resize(self.max_length, 0);
+            attention_mask.resize(self.max_length, 0);
         }
-        let preprocessed = self.tokenizer.encode(text.clone(), true)?;
 
-        let binding = vec![text.to_string()];
-        let input_ids_vector = Self::get_input_ids_vector(preprocessed.clone(), &binding)?;
+        // Preparar inputs como tensores con forma [1, max_length]
+        let input_ids_array = Array::from_shape_vec((1, self.max_length), input_ids)?;
+        let attention_mask_array = Array::from_shape_vec((1, self.max_length), attention_mask)?;
 
-        let binding = vec![text.to_string()];
-        let attention_mask_vector = Self::get_attention_mask_vector(preprocessed, &binding)?;
+        // Convertir a tensores usando la nueva API
+        let input_ids_tensor = Value::from_array(
+            self.session.inputs[0].input_type.data_type()?,
+            input_ids_array
+        )?;
+        
+        let attention_mask_tensor = Value::from_array(
+            self.session.inputs[1].input_type.data_type()?,
+            attention_mask_array
+        )?;
 
-        let session = &self.session;
+        // Ejecutar sesión
+        let outputs = self.session.run(vec![input_ids_tensor, attention_mask_tensor])?;
 
-        // Input name: input_ids, shape: [0, 0]
-        // Output name: embedding, shape: [512]
-        let outputs = session.run(vec![
-            Value::from_array(session.allocator(), &input_ids_vector)?,
-            Value::from_array(session.allocator(), &attention_mask_vector)?,
-        ])?;
-
-        let text_embed_index = 1;
-        let embeddings = try_extract(outputs, text_embed_index)?;
-        Ok(embeddings)
-    }
-
-    fn create_tokenizer(
-        text_model_for_tokenizer: &str,
-    ) -> Result<Tokenizer, Box<dyn Error + Send + Sync>> {
-        let mut tokenizer = Tokenizer::from_pretrained(text_model_for_tokenizer, None)?;
-        tokenizer.with_padding(Some(tokenizers::PaddingParams {
-            strategy: tokenizers::PaddingStrategy::BatchLongest,
-            direction: tokenizers::PaddingDirection::Right,
-            pad_to_multiple_of: None,
-            pad_id: 0,
-            pad_type_id: 0,
-            pad_token: "[PAD]".to_string(),
-        }));
-        Ok(tokenizer)
-    }
-
-    fn get_attention_mask_vector(
-        preprocessed: Encoding,
-        text: &Vec<String>,
-    ) -> Result<ArrayBase<CowRepr<'_, i64>, Dim<IxDynImpl>>, Box<dyn Error + Send + Sync>> {
-        let attention_mask_vector: Vec<i64> = preprocessed
-            .get_attention_mask()
+        // Extraer embeddings (mean pooling)
+        let token_embeddings = outputs[0].try_extract::<f32>()?;
+        
+        // Mean pooling (promediar sobre la dimensión de tokens)
+        let embedding = token_embeddings.view()
+            .mean_axis(Axis(1))
+            .ok_or_else(|| anyhow!("Mean pooling failed"))?
             .iter()
-            .map(|b| *b as i64)
-            .collect::<Vec<i64>>();
-        let mask_shape = (text.len(), attention_mask_vector.len() / text.len());
-        let attention_mask_vector =
-            CowArray::from(Array2::from_shape_vec(mask_shape, attention_mask_vector)?).into_dyn();
-        Ok(attention_mask_vector)
-    }
+            .copied()
+            .collect();
 
-    fn get_input_ids_vector(
-        preprocessed: Encoding,
-        text: &Vec<String>,
-    ) -> Result<ArrayBase<CowRepr<'_, i64>, Dim<IxDynImpl>>, Box<dyn Error + Send + Sync>> {
-        let input_ids_vector: Vec<i64> = preprocessed
-            .get_ids()
-            .iter()
-            .map(|b| *b as i64)
-            .collect::<Vec<i64>>();
-        let ids_shape = (text.len(), input_ids_vector.len() / text.len());
-        let input_ids_vector =
-            CowArray::from(Array2::from_shape_vec(ids_shape, input_ids_vector)?).into_dyn();
-        Ok(input_ids_vector)
+        Ok(embedding)
     }
 }
 
 pub struct EmbedImage {
     session: Session,
-    preprocesser: CLIPImageProcessor
-    
+    image_size: (u32, u32),
+    mean: [f32; 3],
+    std: [f32; 3],
 }
 
 impl EmbedImage {
-    pub fn new(
-        model_path: &str
-    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let session = create_session(model_path)?;
-        let clip_image_processor = CLIPImageProcessor::default();
+    pub fn new(model_path: &str) -> Result<Self> {
+        // Crear entorno
+        let environment = Environment::builder()
+            .with_name("fashion-clip-image")
+            .build()?
+            .into_arc();
+
+        // Crear sesión con la nueva API
+        let session = SessionBuilder::new()
+            .with_environment(environment)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .with_intra_threads(4)?
+            .commit_from_file(model_path)?;
+
         Ok(Self {
             session,
-            preprocesser: clip_image_processor
+            image_size: (224, 224), // Tamaño estándar para ViT
+            mean: [0.48145466, 0.4578275, 0.40821073],
+            std: [0.26862954, 0.26130258, 0.27577711],
         })
     }
 
-    pub fn encode(
-        &self,
-        images_bytes: Vec<u8>,
-    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        let pixels = self.preprocesser.preprocess(images_bytes.to_vec());
+    pub fn encode(&self, image_bytes: &[u8]) -> Result<Vec<f32>> {
+        // Cargar y preprocesar imagen
+        let img = image::load_from_memory(image_bytes)?;
+        let tensor = self.preprocess_image(&img)?;
+        
+        // Ejecutar sesión
+        let outputs = self.session.run(vec![tensor])?;
 
-        let placeholder_input_ids = Array::from_elem((1, 1), 0_i64).into_dyn().into(); // Placeholder for input_ids
-        let placeholder_attention_mask = Array::from_elem((1, 1), 0_i64).into_dyn().into(); // Placeholder for attention_mask
-
-        let session = &self.session;
-        let binding = pixels.into_dyn();
-        let outputs = session.run(vec![
-            Value::from_array(session.allocator(), &placeholder_input_ids)?,
-            Value::from_array(session.allocator(), &binding)?,
-            Value::from_array(session.allocator(), &placeholder_attention_mask)?,
-        ])?;
-
-        let binding = outputs[3].try_extract()?;
-        let embeddings = binding.view();
-
-        let seq_len = embeddings.shape().get(1).unwrap();
-
-        let embeddings: Vec<Vec<f32>> = embeddings
+        // Extraer embeddings (CLS token o pooled output)
+        let embedding = outputs[0]
+            .try_extract::<f32>()?
+            .view()
             .iter()
             .copied()
-            .chunks(*seq_len)
-            .into_iter()
-            .map(|b| b.collect())
             .collect();
-        let embedding = embeddings[0].clone();
+
         Ok(embedding)
+    }
+
+    fn preprocess_image(&self, img: &DynamicImage) -> Result<Value> {
+        // Redimensionar
+        let resized = img.resize_exact(
+            self.image_size.0,
+            self.image_size.1,
+            image::imageops::FilterType::CatmullRom,
+        );
+
+        let rgb = resized.to_rgb8();
+        let (width, height) = rgb.dimensions();
+        
+        // Crear array con forma [1, 3, height, width]
+        let mut array = Array::zeros((1, 3, height as usize, width as usize));
+
+        // Normalizar píxeles
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = rgb.get_pixel(x, y);
+                for c in 0..3 {
+                    array[[0, c, y as usize, x as usize]] = 
+                        (pixel[c] as f32 / 255.0 - self.mean[c]) / self.std[c];
+                }
+            }
+        }
+
+        Ok(Value::from_array(
+            self.session.inputs[0].input_type.data_type()?,
+            array
+        )?)
     }
 }
 
-fn create_session(model_path: &str) -> Result<Session, Box<dyn Error + Send + Sync>> {
+// Función auxiliar para crear sesión (para compatibilidad con código existente)
+pub fn create_session(model_path: &str) -> Result<Session> {
     let environment = Environment::builder()
         .with_name("embed-rs")
         .build()?
@@ -167,23 +191,4 @@ fn create_session(model_path: &str) -> Result<Session, Box<dyn Error + Send + Sy
         .commit_from_file(model_path)?;
     
     Ok(session)
-}
-fn try_extract(
-    outputs: Vec<Value<'_>>,
-    embed_index: usize,
-) -> Result<Vec<f32>, Box<dyn Error + Send + Sync>> {
-    let binding = outputs[embed_index].try_extract()?;
-    let embeddings = binding.view();
-    let seq_len = embeddings
-        .shape()
-        .first()
-        .ok_or("cannot find seq_len with index 0 in text embeddings")?;
-    let embeddings: Vec<f32> = embeddings
-        .iter()
-        .copied()
-        .chunks(*seq_len)
-        .into_iter()
-        .flatten()
-        .collect();
-    Ok(embeddings)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "fashion-clip-rs"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 authors = ["canavar"]
 description = "A complete(grpc service and lib) Rust inference with multilingual embedding support. This version leverages the power of Rust for both GRPC services and as a standalone library, providing highly efficient text and image embeddings for fashion."
@@ -14,10 +14,10 @@ ndarray = "0.15.6"
 itertools = "0.12.0"
 num_cpus = "1.16.0"
 prost = "0.12.3"
-tokenizers = {version = "0.15", features = ["hf-hub", "http"] } 
+tokenizers = "0.19.1"
 tokio = { version = "1.35.1", features = ["macros", "rt-multi-thread"] }
 tonic = {version = "0.10.2", features = ["gzip"]}
-image = "0.24.7"
+image = "0.24.9"
 clap = { version = "4.4.11", features = ["derive"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde_json = "1.0.108"
@@ -28,12 +28,18 @@ ort = "2.0.0-rc.11"
 serde = "1.0.193"
 toml = "0.8.8"
 tonic-health = "0.10.2"
-
+anyhow = "1.0"
+thiserror = "1.0"
 
 [build-dependencies]
 tonic-build = "0.10.2"
+
+[features]
+default = []
+async = ["ort/async"]  # Si quieres soporte async
 
 [dev-dependencies]
 prost = "0.12.3"
 approx = "0.5.1"
 cargo-tarpaulin = "0.27.2"
+tokio = { version = "1.35", features = ["rt", "macros"] }

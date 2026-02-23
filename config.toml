@@ -26,5 +26,3 @@ text_example = "This is an example sentence."
 image = "tests/data/test_image.jpg"
 image_url = "https://fns.modanisa.com/r/pro2/2022/12/30/z--8598610-2.jpg"
 
-[dependencies]
-ort = "2.0.0-rc.11"

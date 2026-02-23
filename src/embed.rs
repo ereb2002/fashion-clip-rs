@@ -1,7 +1,13 @@
 use std::error::Error;
 use itertools::Itertools;
 use ndarray::{Array, Array2, ArrayBase, CowArray, CowRepr, Dim, IxDynImpl};
-use ort::{Environment, ExecutionProvider, GraphOptimizationLevel, Session, SessionBuilder, Value};
+use ort::{
+    environment::Environment,
+    execution_providers::ExecutionProvider,
+    session::{builder::GraphOptimizationLevel, Session},
+    value::Value,
+    SessionBuilder,
+};
 use tokenizers::{Encoding, Tokenizer};
 
 use crate::clip_image_processor::CLIPImageProcessor;

@@ -1,15 +1,13 @@
 // src/embed.rs
 use anyhow::{anyhow, Result};
 use image::DynamicImage;
-use ndarray::{Array, Axis, s};
+use ndarray::{Array, Axis};
 use ort::{
-    Environment, 
-    Session, 
-    SessionBuilder,
-    Tensor,
-    TensorElementType,
+    environment::Environment,
+    session::{builder::GraphOptimizationLevel, Session},
+    session::builder::SessionBuilder,
+    value::{Tensor, Value},
 };
-use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -21,9 +19,17 @@ pub struct EmbedText {
 
 impl EmbedText {
     pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self> {
-        // Cargar sesión directamente sin Environment explícito
-        let session = SessionBuilder::new()?
-            .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
+        // Crear entorno
+        let environment = Arc::new(
+            Environment::builder()
+                .with_name("fashion-clip-text")
+                .build()?
+        );
+
+        // Crear sesión
+        let session = SessionBuilder::new()
+            .with_environment(environment)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
 
@@ -55,46 +61,53 @@ impl EmbedText {
             attention_mask.resize(self.max_length, 0);
         }
 
-        // Crear tensores con la forma correcta [1, max_length]
-        let input_ids_shape = vec![1, self.max_length];
+        // Convertir a i64 (típico para modelos de texto)
+        let input_ids_i64: Vec<i64> = input_ids.iter().map(|&x| x as i64).collect();
+        let attention_mask_i64: Vec<i64> = attention_mask.iter().map(|&x| x as i64).collect();
+
+        // Crear tensores
         let input_ids_tensor = Tensor::from_array(
-            input_ids_shape,
-            &input_ids
+            self.session.inputs[0].input_type.data_type()?,
+            &input_ids_i64,
+            &[1, self.max_length]
         )?;
 
-        let attention_mask_shape = vec![1, self.max_length];
         let attention_mask_tensor = Tensor::from_array(
-            attention_mask_shape,
-            &attention_mask
+            self.session.inputs[1].input_type.data_type()?,
+            &attention_mask_i64,
+            &[1, self.max_length]
         )?;
 
-        // Ejecutar sesión con nombres de entrada
-        let outputs = self.session.run(
-            vec![
-                ("input_ids", input_ids_tensor.into()),
-                ("attention_mask", attention_mask_tensor.into()),
-            ]
-        )?;
+        // Ejecutar sesión
+        let outputs = self.session.run(vec![
+            Value::from_tensor(input_ids_tensor)?,
+            Value::from_tensor(attention_mask_tensor)?,
+        ])?;
 
-        // Obtener el output (normalmente "last_hidden_state" o "pooler_output")
-        let output_tensor = outputs[0].try_extract::<f32>()?;
-        
-        // Mean pooling sobre la dimensión de tokens
+        // Extraer embeddings
+        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
         let shape = output_tensor.shape();
-        let batch_size = shape[0];
-        let seq_len = shape[1];
-        let hidden_size = shape[2];
-
-        let output_array = Array::from_shape_vec(
-            (batch_size, seq_len, hidden_size),
-            output_tensor.to_vec()
-        )?;
-
-        // Mean pooling
-        let pooled = output_array.mean_axis(Axis(1))
-            .ok_or_else(|| anyhow!("Mean pooling failed"))?;
-
-        Ok(pooled.to_vec())
+        
+        if shape.len() == 3 {
+            // Forma [batch, seq_len, hidden_size]
+            let batch_size = shape[0];
+            let seq_len = shape[1];
+            let hidden_size = shape[2];
+            
+            let output_array = Array::from_shape_vec(
+                (batch_size, seq_len, hidden_size),
+                output_tensor.as_slice().unwrap().to_vec()
+            )?;
+            
+            // Mean pooling
+            let pooled = output_array.mean_axis(ndarray::Axis(1))
+                .ok_or_else(|| anyhow!("Mean pooling failed"))?;
+            
+            Ok(pooled.to_vec())
+        } else {
+            // Ya es pooled
+            Ok(output_tensor.as_slice().unwrap().to_vec())
+        }
     }
 }
 
@@ -107,8 +120,17 @@ pub struct EmbedImage {
 
 impl EmbedImage {
     pub fn new(model_path: &str) -> Result<Self> {
-        let session = SessionBuilder::new()?
-            .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
+        // Crear entorno
+        let environment = Arc::new(
+            Environment::builder()
+                .with_name("fashion-clip-image")
+                .build()?
+        );
+
+        // Crear sesión
+        let session = SessionBuilder::new()
+            .with_environment(environment)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(4)?
             .commit_from_file(model_path)?;
 
@@ -125,14 +147,11 @@ impl EmbedImage {
         let tensor = self.preprocess_image(&img)?;
         
         let outputs = self.session.run(vec![
-            ("pixel_values", tensor.into())
+            Value::from_tensor(tensor)?
         ])?;
 
-        let embedding = outputs[0]
-            .try_extract::<f32>()?
-            .to_vec();
-
-        Ok(embedding)
+        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
+        Ok(output_tensor.as_slice().unwrap().to_vec())
     }
 
     fn preprocess_image(&self, img: &DynamicImage) -> Result<Tensor<f32>> {
@@ -148,30 +167,40 @@ impl EmbedImage {
         // Crear array con forma [1, 3, height, width]
         let mut data = Vec::with_capacity((width * height * 3) as usize);
         
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = rgb.get_pixel(x, y);
-                for c in 0..3 {
+        for c in 0..3 {
+            for y in 0..height {
+                for x in 0..width {
+                    let pixel = rgb.get_pixel(x, y);
                     let normalized = (pixel[c] as f32 / 255.0 - self.mean[c]) / self.std[c];
                     data.push(normalized);
                 }
             }
         }
 
-        // Crear tensor con la forma correcta
-        let shape = vec![1, 3, height as usize, width as usize];
-        let tensor = Tensor::from_array(shape, &data)?;
+        // Crear tensor
+        let tensor = Tensor::from_array(
+            self.session.inputs[0].input_type.data_type()?,
+            &data,
+            &[1, 3, height as usize, width as usize]
+        )?;
         
         Ok(tensor)
     }
 }
 
-// Función auxiliar para crear sesión
+// Función auxiliar simplificada
 pub fn create_session(model_path: &str) -> Result<Session> {
-    let session = SessionBuilder::new()?
+    let environment = Arc::new(
+        Environment::builder()
+            .with_name("embed-rs")
+            .build()?
+    );
+
+    let session = SessionBuilder::new()
+        .with_environment(environment)?
         .with_parallel_execution(true)?
         .with_intra_threads(num_cpus::get() as i16)?
-        .with_optimization_level(ort::GraphOptimizationLevel::Level3)?
+        .with_optimization_level(GraphOptimizationLevel::Level3)?
         .commit_from_file(model_path)?;
     
     Ok(session)
